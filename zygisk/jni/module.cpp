@@ -1,4 +1,5 @@
 #include <android/log.h>
+#include <android/api-level.h>
 #include <jni.h>
 #include <string.h>
 
@@ -23,7 +24,25 @@ static uint32_t relayout2_code = 0;
 static uint32_t relayoutAsync2_code = 0;
 static uint32_t registerScreenCaptureObserver_code = 0;
 
-static const char* PROC_NAME = "";
+static char PROC_NAME[256] = "";
+static jmethodID parcelSize, parcelPosition, parcelSetPosition;
+static jmethodID parcelReadString, parcelReadBinder, parcelReadInt, parcelWriteInt;
+static jmethodID parcelWriteNoException;
+static jboolean (*transactOrig)(JNIEnv*, jobject, jint, jobject, jobject, jint);
+
+static bool isRelayout(uint32_t code) {
+    return code && (code == relayout_code || code == relayoutAsync_code ||
+                    code == relayout2_code || code == relayoutAsync2_code);
+}
+
+static bool descriptorEquals(JNIEnv* env, jstring value, const char16_t* expected, size_t length) {
+    if (!value || env->GetStringLength(value) != jsize(length)) return false;
+    const jchar* chars = env->GetStringChars(value, nullptr);
+    if (!chars) return false;
+    const bool equal = memcmp(chars, expected, length * sizeof(char16_t)) == 0;
+    env->ReleaseStringChars(value, chars);
+    return equal;
+}
 
 static bool getTransactionCodes(JNIEnv* env) {
     relayout_code = getStaticIntFieldJni(env, BINDER_STUB("android/view/IWindowSession"), BINDER_TRSCTN("relayout"));
@@ -48,63 +67,118 @@ static bool getTransactionCodes(JNIEnv* env) {
     return true;
 }
 
-int (*transactOrig)(void*, int32_t, uint32_t, void*, void*, uint32_t);
+// Window requests contain Binder objects: marshall/unmarshall would discard
+// their object table. Read and overwrite only the flags integer in the original
+// Parcel, and always restore its cursor before forwarding the transaction.
+static jboolean transactHook(JNIEnv* env, jobject self, jint code, jobject data,
+                             jobject reply, jint flags) {
+    const bool relayout = isRelayout(uint32_t(code));
+    const bool observer = code && uint32_t(code) == registerScreenCaptureObserver_code;
+    if ((!relayout && !observer) || !data || env->ExceptionCheck())
+        return transactOrig(env, self, code, data, reply, flags);
 
-int transactHook(void* self, int32_t handle, uint32_t code, void* pdata, void* preply, uint32_t flags) {
-    auto pparcel = (PParcel*)pdata;
-    auto parcel = FakeParcel(pparcel->data, pparcel->data_size);
-
-    size_t binder_headers_len = getBinderHeadersLen(sdk);
-    parcel.skip(binder_headers_len);  // header
-
-    auto descLen = parcel.readInt32();
-    if (descLen == 0) {
-        return transactOrig(self, handle, code, pdata, preply, flags);
+    const jint position = env->CallIntMethod(data, parcelPosition);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return transactOrig(env, self, code, data, reply, flags);
     }
-    auto desc = parcel.readString16(descLen);
-    if (desc == nullptr) {
-        LOGD("ERROR: desc == NULL (%d, %zu)", descLen, pparcel->data_size);
-        return transactOrig(self, handle, code, pdata, preply, flags);
-    }
-
-    if ((code == relayout_code || code == relayoutAsync_code ||
-         code == relayout2_code || code == relayoutAsync2_code) &&
-        BINDER_DESC_CMP(I_WINDOW_SESSION_DESC, desc, descLen)) {
-        // remove FLAG_SECURE mask
-
-        parcel.skipFlatObj();                              // IWindow flat obj
-        if (sdk <= 30) parcel.skip(1 * sizeof(uint32_t));  // seq
-        parcel.skip(4 * sizeof(uint32_t));                 // LayoutParams
-        parcel.skip(3 * sizeof(uint32_t));                 // requestedWidth, requestedHeight, viewVisibility
-
-        auto flags = parcel.peekInt32Ref();
-        if (flags == nullptr) {
-            LOGD("ERROR: flags == NULL");
-        } else if (*flags & FLAG_SECURE) {
-            *flags &= ~FLAG_SECURE;
-            LOGD("Bypassed secure lock");
+    bool suppressObserver = false;
+    do {
+        const jint size = env->CallIntMethod(data, parcelSize);
+        const jint header = getBinderHeadersLen(sdk);
+        if (env->ExceptionCheck() || size < header + 4) break;
+        env->CallVoidMethod(data, parcelSetPosition, header);
+        if (env->ExceptionCheck()) break;
+        auto descriptor = static_cast<jstring>(env->CallObjectMethod(data, parcelReadString));
+        if (env->ExceptionCheck()) break;
+        const bool matches = relayout
+            ? descriptorEquals(env, descriptor, I_WINDOW_SESSION_DESC, STR_LEN(I_WINDOW_SESSION_DESC))
+            : descriptorEquals(env, descriptor, I_ACTIVITY_TASKMANAGER_DESC, STR_LEN(I_ACTIVITY_TASKMANAGER_DESC));
+        if (descriptor) env->DeleteLocalRef(descriptor);
+        if (env->ExceptionCheck() || !matches) break;
+        if (observer) {
+            suppressObserver = true;
+            break;
         }
-    } else if (code == registerScreenCaptureObserver_code &&
-               BINDER_DESC_CMP(I_ACTIVITY_TASKMANAGER_DESC, desc, descLen)) {
-        // early-return from capture listener
-        LOGD("Bypassed screenshot listener");
-        return 0;
+
+        jobject window = env->CallObjectMethod(data, parcelReadBinder);
+        if (window) env->DeleteLocalRef(window);
+        if (env->ExceptionCheck()) break;
+        jint cursor = env->CallIntMethod(data, parcelPosition);
+        // Android 10/11 place a sequence integer before the typed LayoutParams.
+        if (sdk <= 30) cursor += 4;
+        // Presence marker followed by width, height, x, y, type, flags.
+        if (env->ExceptionCheck() || cursor < 0 || cursor > size || size - cursor < 7 * 4) break;
+        env->CallVoidMethod(data, parcelSetPosition, cursor);
+        if (env->ExceptionCheck()) break;
+        const jint present = env->CallIntMethod(data, parcelReadInt);
+        if (env->ExceptionCheck() || present != 1) break;
+        const jint flagsPosition = cursor + 6 * 4;
+        env->CallVoidMethod(data, parcelSetPosition, flagsPosition);
+        if (env->ExceptionCheck()) break;
+        const jint windowFlags = env->CallIntMethod(data, parcelReadInt);
+        if (env->ExceptionCheck()) break;
+        if (windowFlags & FLAG_SECURE) {
+            env->CallVoidMethod(data, parcelSetPosition, flagsPosition);
+            if (env->ExceptionCheck()) break;
+            env->CallVoidMethod(data, parcelWriteInt, windowFlags & ~FLAG_SECURE);
+            if (!env->ExceptionCheck()) LOGD("Bypassed secure lock (JNI)");
+        }
+    } while (false);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    env->CallVoidMethod(data, parcelSetPosition, position);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return transactOrig(env, self, code, data, reply, flags);
     }
-    return transactOrig(self, handle, code, pdata, preply, flags);
+    if (suppressObserver) {
+        // A synchronous Java Binder call expects both true and a valid reply
+        // exception header, rather than the native status_t used by the PLT hook.
+        if (reply && !(flags & 1)) {
+            env->CallVoidMethod(reply, parcelWriteNoException);
+            if (!env->ExceptionCheck()) env->CallVoidMethod(reply, parcelSetPosition, 0);
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                return transactOrig(env, self, code, data, reply, flags);
+            }
+        }
+        LOGD("Bypassed screenshot listener (JNI)");
+        return JNI_TRUE;
+    }
+    return transactOrig(env, self, code, data, reply, flags);
 }
 
-static bool hookBinder(zygisk::Api* api) {
-    ino_t inode;
-    dev_t dev;
-    if (!getMapping("libbinder.so", &inode, &dev)) {
-        LOGD("ERROR: Could not get libbinder");
-        return false;
+static bool hookBinder(zygisk::Api* api, JNIEnv* env) {
+    jclass parcel = env->FindClass("android/os/Parcel");
+    if (!parcel) { env->ExceptionClear(); return false; }
+    // Resolve sequentially: do not make JNI calls with a pending exception.
+    struct Method { jmethodID* id; const char* name; const char* signature; };
+    Method methods[] = {
+        {&parcelSize, "dataSize", "()I"},
+        {&parcelPosition, "dataPosition", "()I"},
+        {&parcelSetPosition, "setDataPosition", "(I)V"},
+        {&parcelReadString, "readString", "()Ljava/lang/String;"},
+        {&parcelReadBinder, "readStrongBinder", "()Landroid/os/IBinder;"},
+        {&parcelReadInt, "readInt", "()I"},
+        {&parcelWriteInt, "writeInt", "(I)V"},
+        {&parcelWriteNoException, "writeNoException", "()V"},
+    };
+    for (auto& method : methods) {
+        *method.id = env->GetMethodID(parcel, method.name, method.signature);
+        if (!*method.id || env->ExceptionCheck()) {
+            env->ExceptionClear();
+            env->DeleteLocalRef(parcel);
+            return false;
+        }
     }
-
-    api->pltHookRegister(dev, inode, "_ZN7android14IPCThreadState8transactEijRKNS_6ParcelEPS1_j",
-                         (void**)&transactHook, (void**)&transactOrig);
-    if (!api->pltHookCommit()) {
-        LOGD("ERROR: pltHookCommit");
+    env->DeleteLocalRef(parcel);
+    JNINativeMethod hook[] = {{const_cast<char*>("transactNative"),
+        const_cast<char*>("(ILandroid/os/Parcel;Landroid/os/Parcel;I)Z"),
+        reinterpret_cast<void*>(transactHook)}};
+    api->hookJniNativeMethods(env, "android/os/BinderProxy", hook, 1);
+    transactOrig = reinterpret_cast<decltype(transactOrig)>(hook[0].fnPtr);
+    if (!transactOrig || transactOrig == transactHook) {
+        LOGD("ERROR: BinderProxy JNI hook unavailable");
         return false;
     }
     return true;
@@ -117,7 +191,7 @@ static bool run(zygisk::Api* api, JNIEnv* env) {
         return false;
     }
     if (!getTransactionCodes(env)) return false;
-    if (!hookBinder(api)) return false;
+    if (!hookBinder(api, env)) return false;
     return true;
 }
 
@@ -129,10 +203,21 @@ class ih8SecureLock : public zygisk::ModuleBase {
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
-        (void)args;
         if (api->getFlags() & zygisk::StateFlag::PROCESS_ON_DENYLIST) {
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
         }
+        const char* name = env->GetStringUTFChars(args->nice_name, nullptr);
+        if (!name) {
+            env->ExceptionClear();
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+        strncpy(PROC_NAME, name, sizeof(PROC_NAME) - 1);
+        env->ReleaseStringUTFChars(args->nice_name, name);
+        // Zygisk's JNI hook API must be used before specialization completes.
+        loaded = run(api, env);
+        if (!loaded) api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
     }
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs* args) override {
@@ -141,20 +226,12 @@ class ih8SecureLock : public zygisk::ModuleBase {
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs* args) override {
-        if (api->getFlags() & zygisk::StateFlag::PROCESS_ON_DENYLIST) {
-            return;
-        }
-
-        PROC_NAME = env->GetStringUTFChars(args->nice_name, nullptr);
-        if (!run(api, env)) {
-            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
-            env->ReleaseStringUTFChars(args->nice_name, PROC_NAME);
-        } else {
-            LOGD("Loaded");
-        }
+        (void)args;
+        if (loaded) LOGD("Loaded (BinderProxy JNI hook)");
     }
 
    private:
+    bool loaded = false;
     zygisk::Api* api;
     JNIEnv* env;
 };

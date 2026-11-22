@@ -43,11 +43,13 @@ uint32_t getStaticIntFieldJni(JNIEnv* env, const char* cls_name, const char* fie
     }
     jfieldID field = env->GetStaticFieldID(cls, field_name, "I");
     if (field == nullptr) {
+        env->DeleteLocalRef(cls);
         env->ExceptionClear();
         LOGD("ERROR getStaticIntFieldJni: Could not get field %s.%s", cls_name, field_name);
         return 0;
     }
     jint val = env->GetStaticIntField(cls, field);
+    env->DeleteLocalRef(cls);
     return val;
 }
 

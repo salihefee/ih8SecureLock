@@ -1,7 +1,7 @@
 id=ih8SecureLock
 name=ih8SecureLock
-version=v11
-versionCode=11
+version=v11-jni-fix
+versionCode=12
 author=j-hc
-description=Prevent apps from blocking and listening to your screenshots with Zygisk
+description=Prevent apps from blocking and listening to your screenshots with the BinderProxy JNI hook
 updateJson=https://raw.githubusercontent.com/j-hc/ih8SecureLock/master/update.json
